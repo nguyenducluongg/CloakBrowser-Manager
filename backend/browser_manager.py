@@ -142,7 +142,8 @@ def _init_profile_defaults(user_data_dir: Path) -> None:
         logger.info("Set DuckDuckGo as default search for %s", user_data_dir.name)
 
 
-BASE_CDP_PORT = 5100  # CDP ports: 5100, 5101, ... (parallels VNC 6100+)
+BASE_CDP_PORT = 5100
+CDP_PORT_RANGE = 100  # cycle through 5100-5199 to avoid TIME_WAIT collisions
 
 
 @dataclass
@@ -160,6 +161,7 @@ class BrowserManager:
         self._launching: set[str] = set()  # profile IDs currently being launched
         self.vnc = VNCManager()
         self._lock = asyncio.Lock()
+        self._next_cdp_port = BASE_CDP_PORT
         self._auto_launch_task: asyncio.Task | None = None
 
     async def launch(self, profile: dict[str, Any]) -> RunningProfile:
@@ -172,17 +174,14 @@ class BrowserManager:
             self._launching.add(profile_id)
 
         display, ws_port = await self.vnc.allocate()
-        cdp_port = BASE_CDP_PORT + (display - self.vnc.BASE_DISPLAY)
 
-        # Verify CDP port is available before launching Chrome on it
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.bind(("127.0.0.1", cdp_port))
-            except OSError:
-                async with self._lock:
-                    self._launching.discard(profile_id)
-                await self.vnc.stop_vnc(display)
-                raise ValueError(f"CDP port {cdp_port} is already in use")
+        try:
+            cdp_port = self._allocate_cdp_port()
+        except ValueError:
+            async with self._lock:
+                self._launching.discard(profile_id)
+            await self.vnc.stop_vnc(display)
+            raise
 
         # Clean stale Chromium lock files (left by previous container crashes)
         user_data_dir = Path(profile["user_data_dir"])
@@ -361,6 +360,21 @@ class BrowserManager:
                     profile["name"], profile["id"], exc,
                 )
         logger.info("Auto-launch complete: %d running", len(self.running))
+
+    def _allocate_cdp_port(self) -> int:
+        """Find a free CDP port using a rotating counter to avoid TIME_WAIT collisions."""
+        for _ in range(CDP_PORT_RANGE):
+            port = self._next_cdp_port
+            self._next_cdp_port = BASE_CDP_PORT + (
+                (self._next_cdp_port + 1 - BASE_CDP_PORT) % CDP_PORT_RANGE
+            )
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                try:
+                    s.bind(("127.0.0.1", port))
+                    return port
+                except OSError:
+                    continue
+        raise ValueError("No free CDP ports available in range %d-%d" % (BASE_CDP_PORT, BASE_CDP_PORT + CDP_PORT_RANGE - 1))
 
     def _build_fingerprint_args(self, profile: dict[str, Any]) -> list[str]:
         """Build extra Chromium args from profile fingerprint settings."""
